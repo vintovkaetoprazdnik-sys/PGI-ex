@@ -7,6 +7,7 @@ from ortools.sat.python import cp_model
 import calendar
 import json
 import os
+import io
 
 # --- НАСТРОЙКИ СТРАНИЦЫ ---
 st.set_page_config(page_title="ПГИ Экскурсии", page_icon="🗓️", layout="wide")
@@ -21,8 +22,6 @@ default_config = {
     "end_time_hour": 18,
     "time_step_minutes": 30
 }
-
-# Загружаем текущий конфиг (если файла нет - берем дефолтный)
 if os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, "r") as f:
         current_config = json.load(f)
@@ -36,7 +35,6 @@ creds = Credentials.from_service_account_info(
     scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 )
 client = gspread.authorize(creds)
-
 SHEET_ID = '1CVv12SLURD2-he_TEwI9LTIYbe22-KN4yth67Hngyno'
 
 @st.cache_data(ttl=10)
@@ -58,21 +56,15 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
     PRESENCE_BONUS = config["presence_bonus"]
     QUANTITY_BONUS = config["quantity_bonus"]
     
-    # Генерируем возможные времена старта на основе конфига
     possible_start_times = []
-    start_h = config["start_time_hour"]
-    end_h = config["end_time_hour"]
+    curr = config["start_time_hour"]
     step = config["time_step_minutes"] / 60.0
-    curr = start_h
-    while curr <= end_h:
+    while curr <= config["end_time_hour"]:
         possible_start_times.append(curr)
         curr += step
 
-    days_info = {}
-    for day in range(1, DAYS_IN_MONTH + 1):
-        d = datetime.date(year, month, day)
-        days_info[day] = d.weekday()
-
+    days_info = {day: datetime.date(year, month, day).weekday() for day in range(1, DAYS_IN_MONTH + 1)}
+    
     all_guides = set()
     for guides_str in df_tours['Гиды'].dropna():
         for g in guides_str.split(';'):
@@ -85,7 +77,6 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
         guide = str(row['Гид']).strip()
         date_str = str(row['Дата']).strip()
         is_available = str(row['Доступен']).strip().lower() == 'да'
-        
         if not guide or not date_str: continue
         try:
             dt = datetime.datetime.strptime(date_str, '%d.%m.%Y')
@@ -107,18 +98,15 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
         guides = [g.strip() for g in str(row['Гиды']).split(';') if g.strip()]
         is_summer = month in [6, 7, 8]
         freq = int(row['Лето, раз в месяц']) if is_summer else int(row['Зима, раз в месяц'])
-        
         days_limit = None
         days_str = str(row['Ограничение по дням']).strip().lower()
         if 'суббота' in days_str: days_limit = [5]
         elif 'воскресенье' in days_str: days_limit = [6]
-        
         time_val = row['Ограничение по времени']
         fixed_time = None
         if pd.notna(time_val) and str(time_val).strip():
             t_str = str(time_val).strip()
             fixed_time = int(t_str.split(':')[0]) + int(t_str.split(':')[1])/60 if ':' in t_str else float(t_str)
-            
         duration = float(row['Продолжительность'])
         tours.append({"name": name, "duration": duration, "guides": guides, "days": days_limit, "time": fixed_time, "freq": freq})
 
@@ -135,19 +123,15 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
                 
             for g_idx, guide_name in enumerate(tour["guides"]):
                 if day not in guide_limits.get(guide_name, {}): continue
-                    
                 g_start_limit, g_end_limit = guide_limits[guide_name][day]
                 times_to_check = [tour["time"]] if tour["time"] is not None else possible_start_times
                 
                 for start_time in times_to_check:
                     if start_time < g_start_limit or (start_time + tour["duration"]) > g_end_limit: continue
-
                     var = model.NewBoolVar(f't_{t_idx}_d_{day}_g_{guide_name}_time_{start_time}')
                     tour_assigns[(day, guide_name, start_time)] = var
-                    
                     start_min = int(start_time * 60)
                     end_min = int((start_time + tour["duration"] + REST_TIME_HOURS) * 60) 
-                    
                     intervals[guide_name].append(model.NewOptionalIntervalVar(
                         model.NewConstant(start_min), model.NewConstant(end_min - start_min), 
                         model.NewConstant(end_min), var, f'opt_int_{t_idx}_{day}_{guide_name}_t_{start_time}'
@@ -170,7 +154,6 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
             vars_for_slot = [var for (d, g, st), var in assignments[t_idx].items() if d == day and st == start_time]
             model.Add(sum(vars_for_slot) <= 1)
 
-    # --- ИСПОЛЬЗУЕМ ВЕСА ИЗ КОНФИГА ---
     tour_is_present = []
     bonus_for_presence = []
     for t_idx, tour in enumerate(tours):
@@ -198,7 +181,6 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
         def on_solution_callback(self):
             current_solution = []
             current_solution_vars = [] 
-            
             for t_idx, tour_assigns in enumerate(self._assignments):
                 for (day, guide_name, start_time), var in tour_assigns.items():
                     if self.Value(var) == 1:
@@ -206,7 +188,6 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
                         start_str = f"{int(start_time):02d}:{int((start_time % 1) * 60):02d}"
                         end_time = start_time + self._tours[t_idx]["duration"]
                         end_str = f"{int(end_time):02d}:{int((end_time % 1) * 60):02d}"
-                        
                         current_solution.append({
                             "Дата": f"{day:02d}.{month:02d}.{year}",
                             "День недели": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][days_info[day]],
@@ -214,7 +195,6 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
                             "Гид": guide_name,
                             "Время": f"{start_str} - {end_str}"
                         })
-            
             if current_solution:
                 self.solutions.append(current_solution)
                 if len(self.solutions) >= 3: 
@@ -229,6 +209,60 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
     printer = SolutionPrinter(assignments, tours, model)
     solver.Solve(model, printer)
     return printer.solutions
+
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ EXCEL-МАТРИЦЫ ---
+def create_excel_matrix(df_result, all_guides_list, month, year):
+    # Создаем объект BytesIO для хранения файла в памяти
+    output = io.BytesIO()
+    
+    # Создаем Excel-файл с помощью pandas (он использует openpyxl под капотом)
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Лист 1: Обычная таблица (для удобного просмотра/фильтрации)
+        df_result.to_excel(writer, sheet_name='Список', index=False)
+        
+        # Лист 2: Матрица (Гиды x Даты)
+        # 1. Вытаскиваем все уникальные даты из результата и сортируем их
+        dates = sorted(list(set(df_result['Дата'])))
+        
+        # 2. Формируем "пустую" матрицу
+        matrix_data = []
+        for guide in all_guides_list:
+            row = {"Гиды": guide}
+            for date in dates:
+                row[date] = ""
+            matrix_data.append(row)
+            
+        df_matrix = pd.DataFrame(matrix_data)
+        
+        # 3. Заполняем матрицу данными
+        for idx, row in df_result.iterrows():
+            guide = row['Гид']
+            date = row['Дата']
+            time_str = row['Время'].split(' - ')[0] # Берем только время начала
+            tour = row['Экскурсия']
+            
+            # Находим строку гида и столбец даты, записываем туда данные
+            # Формат: "11:00 Название"
+            df_matrix.loc[df_matrix['Гиды'] == guide, date] = f"{time_str} {tour}"
+            
+        # 4. Записываем матрицу на второй лист
+        df_matrix.to_excel(writer, sheet_name='Матрица', index=False)
+        
+        # 5. Применяем стили (через openpyxl)
+        worksheet = writer.sheets['Матрица']
+        
+        # Красим шапку и делаем жирный шрифт
+        from openpyxl.styles import Font, Alignment, PatternFill
+        for col in worksheet.columns:
+            for cell in col:
+                cell.alignment = Alignment(vertical='center', wrap_text=True)
+        
+        # Настраиваем ширину столбцов (чтобы влезал текст)
+        worksheet.column_dimensions['A'].width = 25 # Ширина колонки с именами
+        for col_letter in ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P']:
+            worksheet.column_dimensions[col_letter].width = 20
+
+    return output.getvalue()
 
 # --- ИНТЕРФЕЙС ---
 st.title("🗓️ Планировщик экскурсий ПГИ")
@@ -259,30 +293,36 @@ with tab1:
 
     if st.button("🚀 Сгенерировать расписание", type="primary"):
         with st.spinner("Алгоритм подбирает лучшие варианты..."):
-            # Передаем текущий конфиг в алгоритм
             solutions = generate_schedule(df_tours, df_avail, selected_year, selected_month, weekends_only, current_config)
             
             if not solutions:
                 st.warning("⚠️ Не удалось составить расписание. Проверьте доступность гидов.")
             else:
                 st.success(f"✅ Найдено {len(solutions)} вариантов расписания!")
+                # Получаем список всех гидов для матрицы
+                all_guides_list = sorted(list(set(df_avail['Гид'].dropna().astype(str).str.strip().tolist()) | set([g.strip() for gs in df_tours['Гиды'].dropna() for g in gs.split(';') if g.strip()])))
+                
                 for i, sol in enumerate(solutions):
                     st.subheader(f"Вариант {i+1}")
                     df_result = pd.DataFrame(sol).sort_values(by=["Дата", "Время"])
+                    
+                    # Красивый вывод на экран
                     st.dataframe(df_result, use_container_width=True, hide_index=True)
                     
-                    csv = df_result.to_csv(index=False).encode('utf-8-sig')
+                    # Генерируем Excel-файл с матрицей
+                    excel_data = create_excel_matrix(df_result, all_guides_list, selected_month, selected_year)
+                    
                     st.download_button(
-                        label="📥 Скачать в Excel (CSV)",
-                        data=csv,
-                        file_name=f"schedule_{selected_month_name}_v{i+1}.csv",
-                        mime="text/csv",
+                        label="📥 Скачать в Excel (Матрица)",
+                        data=excel_data,
+                        file_name=f"schedule_{selected_month_name}_v{i+1}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key=f"download_{i}"
                     )
 
 # --- ВКЛАДКА 2: ВВОД ДОСТУПНОСТИ ---
 with tab2:
-    # (Код второй вкладки остался без изменений, он полностью рабочий)
+    # (Код второй вкладки остался без изменений)
     st.header("Управление доступностью гидов")
     with st.expander("➕ Добавить нового гида в базу"):
         new_guide_name = st.text_input("Введите фамилию и имя нового гида:")
@@ -431,7 +471,7 @@ with tab2:
 # --- ВКЛАДКА 3: НАСТРОЙКИ ---
 with tab3:
     st.header("⚙️ Настройки алгоритма")
-    st.write("Здесь вы можете настроить, как алгоритм будет искать расписание. Изменения сохраняются в файл `config.json` в вашем репозитории.")
+    st.write("Здесь вы можете настроить, как алгоритм будет искать расписание. Изменения сохраняются в памяти приложения, а также в файл `config.json`.")
     
     with st.form("config_form"):
         st.subheader("Приоритеты")
@@ -472,7 +512,6 @@ with tab3:
                 with open(CONFIG_FILE, "w") as f:
                     json.dump(new_config_data, f, indent=4)
                 st.success("✅ Настройки сохранены! Они применятся при следующей генерации расписания.")
-                # Обновляем глобальную переменную, чтобы не перезагружать страницу
                 current_config.update(new_config_data) 
             except Exception as e:
                 st.error(f"Ошибка сохранения: {e}")
