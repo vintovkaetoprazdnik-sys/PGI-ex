@@ -1,0 +1,8 @@
+{
+    "rest_time_hours": 1.5,
+    "presence_bonus": 1000,
+    "quantity_bonus": 10,
+    "start_time_hour": 11,
+    "end_time_hour": 18,
+    "time_step_minutes": 30
+}
