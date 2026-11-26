@@ -5,9 +5,29 @@ import gspread
 from google.oauth2.service_account import Credentials
 from ortools.sat.python import cp_model
 import calendar
+import json
+import os
 
 # --- НАСТРОЙКИ СТРАНИЦЫ ---
 st.set_page_config(page_title="ПГИ Экскурсии", page_icon="🗓️", layout="wide")
+
+# --- ЗАГРУЗКА КОНФИГА ---
+CONFIG_FILE = "config.json"
+default_config = {
+    "rest_time_hours": 1.5,
+    "presence_bonus": 1000,
+    "quantity_bonus": 10,
+    "start_time_hour": 11,
+    "end_time_hour": 18,
+    "time_step_minutes": 30
+}
+
+# Загружаем текущий конфиг (если файла нет - берем дефолтный)
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r") as f:
+        current_config = json.load(f)
+else:
+    current_config = default_config.copy()
 
 # --- ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ---
 creds_dict = st.secrets["gcp_service_account"]
@@ -24,22 +44,30 @@ def load_data():
     spreadsheet = client.open_by_key(SHEET_ID)
     df_tours = pd.DataFrame(spreadsheet.worksheet('ПГИ Экскурсии').get_all_records())
     df_avail = pd.DataFrame(spreadsheet.worksheet('Доступность').get_all_records())
-    
     try:
         ws_guides = spreadsheet.worksheet('Гиды')
         df_guides = pd.DataFrame(ws_guides.get_all_records())
     except gspread.exceptions.WorksheetNotFound:
-        ws_guides = spreadsheet.add_worksheet(title="Гиды", rows=100, cols=1)
-        ws_guides.append_row(["Имя гида"])
         df_guides = pd.DataFrame(columns=["Имя гида"])
-        
     return df_tours, df_avail, df_guides
 
 # --- ФУНКЦИЯ ДЛЯ АЛГОРИТМА ---
-def generate_schedule(df_tours, df_avail, year, month, weekends_only):
+def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
     DAYS_IN_MONTH = calendar.monthrange(year, month)[1]
-    REST_TIME_HOURS = 1.5 
+    REST_TIME_HOURS = config["rest_time_hours"]
+    PRESENCE_BONUS = config["presence_bonus"]
+    QUANTITY_BONUS = config["quantity_bonus"]
     
+    # Генерируем возможные времена старта на основе конфига
+    possible_start_times = []
+    start_h = config["start_time_hour"]
+    end_h = config["end_time_hour"]
+    step = config["time_step_minutes"] / 60.0
+    curr = start_h
+    while curr <= end_h:
+        possible_start_times.append(curr)
+        curr += step
+
     days_info = {}
     for day in range(1, DAYS_IN_MONTH + 1):
         d = datetime.date(year, month, day)
@@ -49,7 +77,6 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only):
     for guides_str in df_tours['Гиды'].dropna():
         for g in guides_str.split(';'):
             if g.strip(): all_guides.add(g.strip())
-            
     for g in df_avail['Гид'].dropna():
         all_guides.add(str(g).strip())
 
@@ -98,7 +125,6 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only):
     model = cp_model.CpModel()
     assignments = [] 
     intervals = {g: [] for g in all_guides} 
-    possible_start_times = [11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0, 16.5, 17.0, 17.5, 18.0]
 
     for t_idx, tour in enumerate(tours):
         tour_assigns = {}
@@ -144,7 +170,7 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only):
             vars_for_slot = [var for (d, g, st), var in assignments[t_idx].items() if d == day and st == start_time]
             model.Add(sum(vars_for_slot) <= 1)
 
-    # --- ВОЗВРАЩАЕМ ПРИОРИТЕТ "ХОТЯ БЫ 1 РАЗ" ---
+    # --- ИСПОЛЬЗУЕМ ВЕСА ИЗ КОНФИГА ---
     tour_is_present = []
     bonus_for_presence = []
     for t_idx, tour in enumerate(tours):
@@ -154,16 +180,13 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only):
             model.Add(sum(vars_for_tour) >= 1).OnlyEnforceIf(is_present)
             model.Add(sum(vars_for_tour) == 0).OnlyEnforceIf(is_present.Not())
             tour_is_present.append(is_present)
-            # ОГРОМНЫЙ бонус за то, что экскурсия попала в план (1000)
-            bonus_for_presence.append(is_present * 1000)
+            bonus_for_presence.append(is_present * PRESENCE_BONUS)
         else:
             tour_is_present.append(model.NewConstant(0))
             bonus_for_presence.append(model.NewConstant(0))
 
-    # ЦЕЛЕВАЯ ФУНКЦИЯ: Максимизируем присутствие всех экскурсий + их общее количество
-    model.Maximize(sum(total_assigned_vars) * 10 + sum(bonus_for_presence))
+    model.Maximize(sum(total_assigned_vars) * QUANTITY_BONUS + sum(bonus_for_presence))
 
-    # --- ПОИСК РЕШЕНИЙ ---
     class SolutionPrinter(cp_model.CpSolverSolutionCallback):
         def __init__(self, assignments, tours, model):
             cp_model.CpSolverSolutionCallback.__init__(self)
@@ -201,7 +224,7 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only):
 
     solver = cp_model.CpSolver()
     solver.parameters.enumerate_all_solutions = True
-    solver.parameters.max_time_in_seconds = 20.0 # Даем 20 секунд на поиск всех 3 вариантов
+    solver.parameters.max_time_in_seconds = 20.0
 
     printer = SolutionPrinter(assignments, tours, model)
     solver.Solve(model, printer)
@@ -216,7 +239,7 @@ except Exception as e:
     st.error(f"❌ Ошибка при чтении таблицы: {e}")
     st.stop()
 
-tab1, tab2 = st.tabs(["Генератор расписания", "Управление доступностью гидов"])
+tab1, tab2, tab3 = st.tabs(["Генератор расписания", "Управление доступностью гидов", "⚙️ Настройки алгоритма"])
 
 # --- ВКЛАДКА 1: ГЕНЕРАТОР ---
 with tab1:
@@ -235,8 +258,9 @@ with tab1:
         weekends_only = st.checkbox("Только выходные", value=True)
 
     if st.button("🚀 Сгенерировать расписание", type="primary"):
-        with st.spinner("Алгоритм подбирает 3 лучших варианта..."):
-            solutions = generate_schedule(df_tours, df_avail, selected_year, selected_month, weekends_only)
+        with st.spinner("Алгоритм подбирает лучшие варианты..."):
+            # Передаем текущий конфиг в алгоритм
+            solutions = generate_schedule(df_tours, df_avail, selected_year, selected_month, weekends_only, current_config)
             
             if not solutions:
                 st.warning("⚠️ Не удалось составить расписание. Проверьте доступность гидов.")
@@ -258,8 +282,8 @@ with tab1:
 
 # --- ВКЛАДКА 2: ВВОД ДОСТУПНОСТИ ---
 with tab2:
+    # (Код второй вкладки остался без изменений, он полностью рабочий)
     st.header("Управление доступностью гидов")
-    
     with st.expander("➕ Добавить нового гида в базу"):
         new_guide_name = st.text_input("Введите фамилию и имя нового гида:")
         if st.button("Добавить гида"):
@@ -277,7 +301,6 @@ with tab2:
                 st.warning("Введите имя.")
 
     st.markdown("---")
-    
     all_guides_list = set(df_guides['Имя гида'].dropna().astype(str).str.strip().tolist())
     for guides in df_tours['Гиды'].dropna():
         for g in guides.split(';'):
@@ -338,7 +361,6 @@ with tab2:
     
     max_days = calendar.monthrange(tab2_year, tab2_month)[1]
     
-    # Кнопка быстрого добавления всего месяца
     if st.button("✨ Сделать доступным ВЕСЬ МЕСЯЦ"):
         try:
             spreadsheet = client.open_by_key(SHEET_ID)
@@ -405,6 +427,55 @@ with tab2:
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ Ошибка при сохранении: {e}")
+
+# --- ВКЛАДКА 3: НАСТРОЙКИ ---
+with tab3:
+    st.header("⚙️ Настройки алгоритма")
+    st.write("Здесь вы можете настроить, как алгоритм будет искать расписание. Изменения сохраняются в файл `config.json` в вашем репозитории.")
+    
+    with st.form("config_form"):
+        st.subheader("Приоритеты")
+        new_presence = st.number_input(
+            "Приоритет 'Хотя бы 1 раз' (чем больше, тем важнее впихнуть все экскурсии, даже в ущерб частоте):", 
+            value=current_config["presence_bonus"], step=100
+        )
+        new_quantity = st.number_input(
+            "Приоритет 'Больше экскурсий' (чем больше, тем важнее провести как можно больше занятий):", 
+            value=current_config["quantity_bonus"], step=1
+        )
+        
+        st.subheader("Временные рамки")
+        new_rest = st.number_input(
+            "Перерыв между экскурсиями одного гида (в часах):", 
+            value=float(current_config["rest_time_hours"]), step=0.5
+        )
+        col_t1, col_t2, col_t3 = st.columns(3)
+        with col_t1:
+            new_start = st.number_input("Самый ранний старт (час):", value=current_config["start_time_hour"], min_value=0, max_value=23)
+        with col_t2:
+            new_end = st.number_input("Самый поздний старт (час):", value=current_config["end_time_hour"], min_value=0, max_value=23)
+        with col_t3:
+            new_step = st.number_input("Шаг подбора времени (в минутах):", value=current_config["time_step_minutes"], min_value=15, max_value=120, step=15)
+            
+        submit_config = st.form_submit_button("💾 Сохранить настройки")
+        
+        if submit_config:
+            new_config_data = {
+                "rest_time_hours": new_rest,
+                "presence_bonus": new_presence,
+                "quantity_bonus": new_quantity,
+                "start_time_hour": new_start,
+                "end_time_hour": new_end,
+                "time_step_minutes": new_step
+            }
+            try:
+                with open(CONFIG_FILE, "w") as f:
+                    json.dump(new_config_data, f, indent=4)
+                st.success("✅ Настройки сохранены! Они применятся при следующей генерации расписания.")
+                # Обновляем глобальную переменную, чтобы не перезагружать страницу
+                current_config.update(new_config_data) 
+            except Exception as e:
+                st.error(f"Ошибка сохранения: {e}")
 
 with st.sidebar:
     st.header("📊 Текущие данные")
