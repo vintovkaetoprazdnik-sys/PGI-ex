@@ -20,11 +20,17 @@ default_config = {
     "quantity_bonus": 10,
     "start_time_hour": 11,
     "end_time_hour": 18,
-    "time_step_minutes": 30
+    "time_step_minutes": 30,
+    "duplicate_penalty": 200, # Новый штраф за дубли
+    "spread_penalty": 100     # Новый штраф за близость
 }
 if os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, "r") as f:
         current_config = json.load(f)
+        # Добавляем недостающие ключи, если конфиг старый
+        for k, v in default_config.items():
+            if k not in current_config:
+                current_config[k] = v
 else:
     current_config = default_config.copy()
 
@@ -55,6 +61,8 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
     REST_TIME_HOURS = config["rest_time_hours"]
     PRESENCE_BONUS = config["presence_bonus"]
     QUANTITY_BONUS = config["quantity_bonus"]
+    DUPLICATE_PENALTY = config["duplicate_penalty"]
+    SPREAD_PENALTY = config["spread_penalty"]
     
     possible_start_times = []
     curr = config["start_time_hour"]
@@ -64,7 +72,9 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
         curr += step
 
     days_info = {day: datetime.date(year, month, day).weekday() for day in range(1, DAYS_IN_MONTH + 1)}
-    
+    valid_days = [d for d in range(1, DAYS_IN_MONTH + 1) if not weekends_only or days_info[d] >= 5]
+    total_valid_days = len(valid_days)
+
     all_guides = set()
     for guides_str in df_tours['Гиды'].dropna():
         for g in guides_str.split(';'):
@@ -108,13 +118,14 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
             t_str = str(time_val).strip()
             fixed_time = int(t_str.split(':')[0]) + int(t_str.split(':')[1])/60 if ':' in t_str else float(t_str)
         duration = float(row['Продолжительность'])
-        tours.append({"name": name, "duration": duration, "guides": guides, "days": days_limit, "time": fixed_time, "freq": freq})
+        tours.append({"name": name, "duration": duration, "guides": guides, "days": days_limit, "time": fixed_time, "freq": freq, "t_idx": len(tours)})
 
     model = cp_model.CpModel()
     assignments = [] 
     intervals = {g: [] for g in all_guides} 
 
-    for t_idx, tour in enumerate(tours):
+    for tour in tours:
+        t_idx = tour["t_idx"]
         tour_assigns = {}
         for day in range(1, DAYS_IN_MONTH + 1):
             day_of_week = days_info[day]
@@ -138,25 +149,71 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
                     ))
         assignments.append(tour_assigns)
 
+    # 1. Гид не может вести 2 экскурсии одновременно (жесткое)
     for guide_name, guide_intervals in intervals.items():
         if guide_intervals: model.AddNoOverlap(guide_intervals)
 
+    # 2. Не превышаем заданную частоту (жесткое)
     total_assigned_vars = []
-    for t_idx, tour in enumerate(tours):
+    for tour in tours:
+        t_idx = tour["t_idx"]
         vars_for_tour = list(assignments[t_idx].values())
         if vars_for_tour:
             model.Add(sum(vars_for_tour) <= tour["freq"])
             total_assigned_vars.extend(vars_for_tour)
 
-    for t_idx, tour in enumerate(tours):
+    # 3. В один день и в одно время на одну экскурсию идет только один гид (жесткое)
+    for tour in tours:
+        t_idx = tour["t_idx"]
         slots = set((day, start_time) for (day, g, start_time) in assignments[t_idx].keys())
         for day, start_time in slots:
             vars_for_slot = [var for (d, g, st), var in assignments[t_idx].items() if d == day and st == start_time]
             model.Add(sum(vars_for_slot) <= 1)
 
+    # --- МЯГКИЕ ОГРАНИЧЕНИЯ (ШТРАФЫ) ---
+    
+    # 4. Штраф за дубли (две одинаковые экскурсии у одного гида в один день)
+    duplicate_penalties = []
+    for tour in tours:
+        t_idx = tour["t_idx"]
+        for guide_name in tour["guides"]:
+            for day in range(1, DAYS_IN_MONTH + 1):
+                vars_for_day_guide = [var for (d, g, st), var in assignments[t_idx].items() if d == day and g == guide_name]
+                # Если гид ведет эту экскурсию больше 1 раза в день, создаем штраф
+                if len(vars_for_day_guide) > 1:
+                    # Количество экскурсий в день минус 1 (это и есть "лишние" дубли)
+                    excess = model.NewIntVar(0, len(vars_for_day_guide), f'excess_{t_idx}_{guide_name}_{day}')
+                    model.Add(excess >= sum(vars_for_day_guide) - 1)
+                    duplicate_penalties.append(excess * DUPLICATE_PENALTY)
+
+    # 5. Штраф за близость (равномерность)
+    spread_penalties = []
+    for tour in tours:
+        if tour["freq"] > 1 and total_valid_days > 0:
+            t_idx = tour["t_idx"]
+            ideal_gap = total_valid_days / tour["freq"]
+            days_available = sorted(list(set(d for (d, g, st) in assignments[t_idx].keys())))
+            
+            for i in range(len(days_available)):
+                for j in range(i + 1, len(days_available)):
+                    d1, d2 = days_available[i], days_available[j]
+                    gap = d2 - d1
+                    # Если разрыв меньше идеального, добавляем штраф
+                    if gap < ideal_gap * 0.8: 
+                        vars_d1 = [var for (d, g, st), var in assignments[t_idx].items() if d == d1]
+                        vars_d2 = [var for (d, g, st), var in assignments[t_idx].items() if d == d2]
+                        
+                        if vars_d1 and vars_d2:
+                            both_selected = model.NewBoolVar(f'both_{t_idx}_{d1}_{d2}')
+                            model.Add(sum(vars_d1) >= 1).OnlyEnforceIf(both_selected)
+                            model.Add(sum(vars_d2) >= 1).OnlyEnforceIf(both_selected)
+                            spread_penalties.append(both_selected * SPREAD_PENALTY)
+
+    # 6. Приоритет "Хотя бы 1 раз"
     tour_is_present = []
     bonus_for_presence = []
-    for t_idx, tour in enumerate(tours):
+    for tour in tours:
+        t_idx = tour["t_idx"]
         vars_for_tour = list(assignments[t_idx].values())
         if vars_for_tour:
             is_present = model.NewBoolVar(f'is_present_{t_idx}')
@@ -168,7 +225,13 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
             tour_is_present.append(model.NewConstant(0))
             bonus_for_presence.append(model.NewConstant(0))
 
-    model.Maximize(sum(total_assigned_vars) * QUANTITY_BONUS + sum(bonus_for_presence))
+    # ИТОГОВАЯ ФУНКЦИЯ
+    model.Maximize(
+        sum(total_assigned_vars) * QUANTITY_BONUS + 
+        sum(bonus_for_presence) - 
+        sum(duplicate_penalties) - 
+        sum(spread_penalties)
+    )
 
     class SolutionPrinter(cp_model.CpSolverSolutionCallback):
         def __init__(self, assignments, tours, model):
@@ -210,21 +273,13 @@ def generate_schedule(df_tours, df_avail, year, month, weekends_only, config):
     solver.Solve(model, printer)
     return printer.solutions
 
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ EXCEL-МАТРИЦЫ ---
+# --- ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ EXCEL-МАТРИЦЫ ---
 def create_excel_matrix(df_result, all_guides_list, month, year):
-    # Создаем объект BytesIO для хранения файла в памяти
     output = io.BytesIO()
-    
-    # Создаем Excel-файл с помощью pandas (он использует openpyxl под капотом)
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Лист 1: Обычная таблица (для удобного просмотра/фильтрации)
         df_result.to_excel(writer, sheet_name='Список', index=False)
         
-        # Лист 2: Матрица (Гиды x Даты)
-        # 1. Вытаскиваем все уникальные даты из результата и сортируем их
         dates = sorted(list(set(df_result['Дата'])))
-        
-        # 2. Формируем "пустую" матрицу
         matrix_data = []
         for guide in all_guides_list:
             row = {"Гиды": guide}
@@ -234,34 +289,31 @@ def create_excel_matrix(df_result, all_guides_list, month, year):
             
         df_matrix = pd.DataFrame(matrix_data)
         
-        # 3. Заполняем матрицу данными
         for idx, row in df_result.iterrows():
             guide = row['Гид']
             date = row['Дата']
-            time_str = row['Время'].split(' - ')[0] # Берем только время начала
+            time_str = row['Время'].split(' - ')[0]
             tour = row['Экскурсия']
             
-            # Находим строку гида и столбец даты, записываем туда данные
-            # Формат: "11:00 Название"
-            df_matrix.loc[df_matrix['Гиды'] == guide, date] = f"{time_str} {tour}"
+            if date in df_matrix.columns:
+                current_val = df_matrix.loc[df_matrix['Гиды'] == guide, date].values[0]
+                new_val = f"{time_str} {tour}"
+                if current_val:
+                    df_matrix.loc[df_matrix['Гиды'] == guide, date] = f"{current_val}\n{new_val}"
+                else:
+                    df_matrix.loc[df_matrix['Гиды'] == guide, date] = new_val
             
-        # 4. Записываем матрицу на второй лист
         df_matrix.to_excel(writer, sheet_name='Матрица', index=False)
         
-        # 5. Применяем стили (через openpyxl)
         worksheet = writer.sheets['Матрица']
-        
-        # Красим шапку и делаем жирный шрифт
-        from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.styles import Alignment
         for col in worksheet.columns:
             for cell in col:
                 cell.alignment = Alignment(vertical='center', wrap_text=True)
         
-        # Настраиваем ширину столбцов (чтобы влезал текст)
-        worksheet.column_dimensions['A'].width = 25 # Ширина колонки с именами
+        worksheet.column_dimensions['A'].width = 25
         for col_letter in ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P']:
             worksheet.column_dimensions[col_letter].width = 20
-
     return output.getvalue()
 
 # --- ИНТЕРФЕЙС ---
@@ -272,6 +324,13 @@ try:
 except Exception as e:
     st.error(f"❌ Ошибка при чтении таблицы: {e}")
     st.stop()
+
+if 'schedule_results' not in st.session_state:
+    st.session_state['schedule_results'] = None
+if 'schedule_month_name' not in st.session_state:
+    st.session_state['schedule_month_name'] = ""
+if 'all_guides_list' not in st.session_state:
+    st.session_state['all_guides_list'] = []
 
 tab1, tab2, tab3 = st.tabs(["Генератор расписания", "Управление доступностью гидов", "⚙️ Настройки алгоритма"])
 
@@ -297,32 +356,34 @@ with tab1:
             
             if not solutions:
                 st.warning("⚠️ Не удалось составить расписание. Проверьте доступность гидов.")
+                st.session_state['schedule_results'] = None
             else:
-                st.success(f"✅ Найдено {len(solutions)} вариантов расписания!")
-                # Получаем список всех гидов для матрицы
+                st.session_state['schedule_results'] = solutions
+                st.session_state['schedule_month_name'] = selected_month_name
                 all_guides_list = sorted(list(set(df_avail['Гид'].dropna().astype(str).str.strip().tolist()) | set([g.strip() for gs in df_tours['Гиды'].dropna() for g in gs.split(';') if g.strip()])))
-                
-                for i, sol in enumerate(solutions):
-                    st.subheader(f"Вариант {i+1}")
-                    df_result = pd.DataFrame(sol).sort_values(by=["Дата", "Время"])
-                    
-                    # Красивый вывод на экран
-                    st.dataframe(df_result, use_container_width=True, hide_index=True)
-                    
-                    # Генерируем Excel-файл с матрицей
-                    excel_data = create_excel_matrix(df_result, all_guides_list, selected_month, selected_year)
-                    
-                    st.download_button(
-                        label="📥 Скачать в Excel (Матрица)",
-                        data=excel_data,
-                        file_name=f"schedule_{selected_month_name}_v{i+1}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_{i}"
-                    )
+                st.session_state['all_guides_list'] = all_guides_list
+
+    if st.session_state['schedule_results']:
+        solutions = st.session_state['schedule_results']
+        st.success(f"✅ Найдено {len(solutions)} вариантов расписания!")
+        
+        for i, sol in enumerate(solutions):
+            st.subheader(f"Вариант {i+1}")
+            df_result = pd.DataFrame(sol).sort_values(by=["Дата", "Время"])
+            st.dataframe(df_result, use_container_width=True, hide_index=True)
+            
+            excel_data = create_excel_matrix(df_result, st.session_state['all_guides_list'], selected_month, selected_year)
+            
+            st.download_button(
+                label="📥 Скачать в Excel (Матрица)",
+                data=excel_data,
+                file_name=f"schedule_{st.session_state['schedule_month_name']}_v{i+1}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_{i}"
+            )
 
 # --- ВКЛАДКА 2: ВВОД ДОСТУПНОСТИ ---
 with tab2:
-    # (Код второй вкладки остался без изменений)
     st.header("Управление доступностью гидов")
     with st.expander("➕ Добавить нового гида в базу"):
         new_guide_name = st.text_input("Введите фамилию и имя нового гида:")
@@ -471,31 +532,23 @@ with tab2:
 # --- ВКЛАДКА 3: НАСТРОЙКИ ---
 with tab3:
     st.header("⚙️ Настройки алгоритма")
-    st.write("Здесь вы можете настроить, как алгоритм будет искать расписание. Изменения сохраняются в памяти приложения, а также в файл `config.json`.")
+    st.write("Здесь вы можете настроить приоритеты. Чем выше значение, тем важнее для алгоритма это правило.")
     
     with st.form("config_form"):
-        st.subheader("Приоритеты")
-        new_presence = st.number_input(
-            "Приоритет 'Хотя бы 1 раз' (чем больше, тем важнее впихнуть все экскурсии, даже в ущерб частоте):", 
-            value=current_config["presence_bonus"], step=100
-        )
-        new_quantity = st.number_input(
-            "Приоритет 'Больше экскурсий' (чем больше, тем важнее провести как можно больше занятий):", 
-            value=current_config["quantity_bonus"], step=1
-        )
+        st.subheader("Приоритеты (Бонусы)")
+        new_presence = st.number_input("Провести КАЖДУЮ экскурсию хотя бы 1 раз:", value=current_config["presence_bonus"], step=100)
+        new_quantity = st.number_input("Провести МАКСИМУМ экскурсий (набрать частоту):", value=current_config["quantity_bonus"], step=1)
+        
+        st.subheader("Штрафы (Чем больше, тем сильнее избегаем)")
+        new_duplicate = st.number_input("Две одинаковые экскурсии у одного гида в один день:", value=current_config["duplicate_penalty"], step=50)
+        new_spread = st.number_input("Слишком близкое проведение одной и той же экскурсии:", value=current_config["spread_penalty"], step=50)
         
         st.subheader("Временные рамки")
-        new_rest = st.number_input(
-            "Перерыв между экскурсиями одного гида (в часах):", 
-            value=float(current_config["rest_time_hours"]), step=0.5
-        )
+        new_rest = st.number_input("Перерыв между экскурсиями (в часах):", value=float(current_config["rest_time_hours"]), step=0.5)
         col_t1, col_t2, col_t3 = st.columns(3)
-        with col_t1:
-            new_start = st.number_input("Самый ранний старт (час):", value=current_config["start_time_hour"], min_value=0, max_value=23)
-        with col_t2:
-            new_end = st.number_input("Самый поздний старт (час):", value=current_config["end_time_hour"], min_value=0, max_value=23)
-        with col_t3:
-            new_step = st.number_input("Шаг подбора времени (в минутах):", value=current_config["time_step_minutes"], min_value=15, max_value=120, step=15)
+        with col_t1: new_start = st.number_input("Самый ранний старт (час):", value=current_config["start_time_hour"], min_value=0, max_value=23)
+        with col_t2: new_end = st.number_input("Самый поздний старт (час):", value=current_config["end_time_hour"], min_value=0, max_value=23)
+        with col_t3: new_step = st.number_input("Шаг подбора (мин):", value=current_config["time_step_minutes"], min_value=15, max_value=120, step=15)
             
         submit_config = st.form_submit_button("💾 Сохранить настройки")
         
@@ -506,12 +559,14 @@ with tab3:
                 "quantity_bonus": new_quantity,
                 "start_time_hour": new_start,
                 "end_time_hour": new_end,
-                "time_step_minutes": new_step
+                "time_step_minutes": new_step,
+                "duplicate_penalty": new_duplicate,
+                "spread_penalty": new_spread
             }
             try:
                 with open(CONFIG_FILE, "w") as f:
                     json.dump(new_config_data, f, indent=4)
-                st.success("✅ Настройки сохранены! Они применятся при следующей генерации расписания.")
+                st.success("✅ Настройки сохранены!")
                 current_config.update(new_config_data) 
             except Exception as e:
                 st.error(f"Ошибка сохранения: {e}")
